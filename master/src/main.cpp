@@ -32,8 +32,8 @@
 #define UDP_PORT     1234
 #define DEBOUNCE_MS    60
 
-#define LIGHT_SLEEP_MS  ( 8UL * 60UL * 1000UL)   //  8 Minuten
-#define DEEP_SLEEP_MS   (18UL * 60UL * 1000UL)   // 18 Minuten
+#define LIGHT_SLEEP_MS  ( 1UL * 60UL * 1000UL)   //  1 Minute
+#define DEEP_SLEEP_MS   (10UL * 60UL * 1000UL)   // 10 Minuten
 #define HOLD_DEEP_MS    4000UL                    //  4 Sek halten
 
 const char*     AP_SSID = "StopwatchNet";
@@ -300,9 +300,11 @@ void loop() {
         }
     }
 
-    // ── 4-Sek-Hold → Deep Sleep ───────────────────────────────────
+    // ── 4-Sek-Hold → Neustart ────────────────────────────────────
     if (btnHeld && (now - btnPressMs) >= HOLD_DEEP_MS) {
-        enterDeepSleep();
+        sendUDP("RESET");
+        delay(100);
+        ESP.restart();
     }
 
     // ── UDP empfangen ─────────────────────────────────────────────
