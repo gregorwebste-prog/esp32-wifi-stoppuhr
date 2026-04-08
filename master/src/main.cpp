@@ -225,9 +225,15 @@ void setup() {
     oled.setCursor(0, 24); oled.print(F("Starte AP..."));
     oled.display();
 
+    btStop();                                  // Bluetooth aus (~5mA gespart)
+    setCpuFrequencyMhz(80);                    // 80MHz (Minimum für WiFi)
+    Serial.printf("[CPU] %lu MHz\n", getCpuFrequencyMhz());
+
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
     delay(500);
+    WiFi.setTxPower(WIFI_POWER_5dBm);         // Sendeleistung 5dBm (~1m reicht)
+    WiFi.setSleep(true);                       // Modem Sleep: größte Stromeinsparung
     Serial.printf("[WiFi] AP: %s  IP: %s\n", AP_SSID,
                   WiFi.softAPIP().toString().c_str());
 
@@ -332,5 +338,6 @@ void loop() {
     else if (state == STOPPED) renderDisplay(elapsedMs,     "STOPP    Knopf=Reset");
     else                       renderDisplay(0,              "Knopf=Start  4s=AUS");
 
-    delay(16);
+    // Im Standby kein Display → CPU länger schlafen lassen
+    delay(inStandby ? 100 : 16);
 }

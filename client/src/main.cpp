@@ -213,6 +213,8 @@ void connectWiFi() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
+        WiFi.setTxPower(WIFI_POWER_5dBm);     // Sendeleistung 5dBm (~1m reicht)
+        WiFi.setSleep(true);                   // Modem Sleep: größte Stromeinsparung
         Serial.printf("\n[WiFi] Verbunden! IP: %s\n",
                       WiFi.localIP().toString().c_str());
         oled.clearDisplay();
@@ -244,6 +246,10 @@ void setup() {
     // Warten bis Taster losgelassen (verhindert Sofort-Neustart nach Wakeup)
     while (digitalRead(BUTTON_PIN) == LOW) delay(10);
     delay(100);
+
+    btStop();                                  // Bluetooth aus (~5mA gespart)
+    setCpuFrequencyMhz(80);                    // 80MHz (Minimum für WiFi)
+    Serial.printf("[CPU] %lu MHz\n", getCpuFrequencyMhz());
 
     analogSetPinAttenuation(BATT_PIN, ADC_11db);
 
@@ -359,5 +365,6 @@ void loop() {
     else if (state == STOPPED) renderDisplay(elapsedMs,     "STOPP    Knopf=Reset");
     else                       renderDisplay(0,              "Knopf=Start  4s=AUS");
 
-    delay(16);
+    // Im Standby kein Display → CPU länger schlafen lassen
+    delay(inStandby ? 100 : 16);
 }
