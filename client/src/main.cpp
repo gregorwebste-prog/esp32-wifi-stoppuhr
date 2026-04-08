@@ -32,9 +32,9 @@
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT  64
 #define UDP_PORT     1234
-#define DEBOUNCE_MS    60
+#define DEBOUNCE_MS    40
 
-#define DEEPSLEEP_MS  (10UL * 60UL * 1000UL)
+#define DEEPSLEEP_MS  (20UL * 60UL * 1000UL)
 #define HOLD_OFF_MS    4000UL
 #define RECONNECT_MS  30000UL
 
@@ -64,6 +64,7 @@ bool          btnHeld       = false;
 // ── Timer ─────────────────────────────────────────────────────────
 unsigned long lastActivityMs  = 0;
 unsigned long lastReconnectMs = 0;
+unsigned long lastElapsedMs   = 0;   // letzte abgeschlossene Zeit
 
 // ── Batterie ──────────────────────────────────────────────────────
 float readBattVoltage() {
@@ -86,9 +87,19 @@ uint8_t detectOLED() {
     return 0x3C;
 }
 
-void renderDisplay(unsigned long ms, const char* statusLine) {
+// Akku-Symbol: 28×10px Körper + 2px Pol, Balken mit 1px Abstand zum Rahmen
+void drawBatteryIcon(int x, int y, int pct) {
+    oled.drawRect(x, y, 28, 10, SSD1306_WHITE);
+    oled.fillRect(x + 28, y + 3, 2, 4, SSD1306_WHITE);
+    int bars = (pct >= 75) ? 4 : (pct >= 50) ? 3 : (pct >= 25) ? 2 : (pct >= 10) ? 1 : 0;
+    for (int i = 0; i < bars; i++)
+        oled.fillRect(x + 2 + i * 6, y + 2, 5, 6, SSD1306_WHITE);
+}
+
+void renderDisplay(unsigned long ms) {
     float vbat = readBattVoltage();
     int   pct  = battPercent(vbat);
+    bool  wifiOk = (WiFi.status() == WL_CONNECTED);
 
     unsigned long m  = ms / 60000UL;
     unsigned long s  = (ms % 60000UL) / 1000UL;
@@ -97,35 +108,46 @@ void renderDisplay(unsigned long ms, const char* statusLine) {
     char timeBuf[10];
     snprintf(timeBuf, sizeof(timeBuf), "%lu:%02lu.%02lu", m, s, cs);
 
-    char battBuf[20];
-    bool wifiOk = (WiFi.status() == WL_CONNECTED);
-    snprintf(battBuf, sizeof(battBuf), "%.2fV %3d%% [%s]",
-             vbat, pct, wifiOk ? "C" : "!!");
-
     oled.clearDisplay();
+
+    // Zeit oben (textSize 3 = 24px hoch)
     oled.setTextSize(3);
-    oled.setCursor(1, 2);
+    oled.setCursor(1, 0);
     oled.print(timeBuf);
 
+    // Strich unter der Zeit
+    oled.drawLine(0, 26, 127, 26, SSD1306_WHITE);
+
+    // Letzte Zeit (klein, unter dem Strich)
     oled.setTextSize(1);
-    oled.setCursor(0, 30);
-    oled.print(battBuf);
+    if (lastElapsedMs > 0) {
+        unsigned long lm  = lastElapsedMs / 60000UL;
+        unsigned long ls  = (lastElapsedMs % 60000UL) / 1000UL;
+        unsigned long lcs = (lastElapsedMs % 1000UL) / 10UL;
+        char lastBuf[18];
+        snprintf(lastBuf, sizeof(lastBuf), "L = %lu:%02lu.%02lu", lm, ls, lcs);
+        oled.setCursor(0, 30);
+        oled.print(lastBuf);
+    }
 
-    oled.drawLine(0, 41, 127, 41, SSD1306_WHITE);
-
-    oled.setCursor(0, 44);
-    oled.print(statusLine);
-
+    // Sleep-Countdown (nur letzte 60s, wenn nicht läuft)
     if (state != RUNNING) {
         unsigned long idleSec = (millis() - lastActivityMs) / 1000UL;
         long secsLeft = (long)(DEEPSLEEP_MS / 1000UL) - (long)idleSec;
         if (secsLeft > 0 && secsLeft <= 60) {
-            char hint[22];
+            char hint[18];
             snprintf(hint, sizeof(hint), "Sleep in %lds", secsLeft);
-            oled.setCursor(0, 56);
+            oled.setCursor(0, 40);
             oled.print(hint);
         }
     }
+
+    // Akku-Symbol (28×10) + % + Volt + [C/!] unten
+    drawBatteryIcon(0, 49, pct);
+    char battBuf[18];
+    snprintf(battBuf, sizeof(battBuf), "%d%%  %.2fV [%s]", pct, vbat, wifiOk ? "C" : "!");
+    oled.setCursor(33, 50);
+    oled.print(battBuf);
 
     oled.display();
 }
@@ -142,7 +164,7 @@ void sendUDP(const char* msg) {
 // ── Aktionen ──────────────────────────────────────────────────────
 void doStart()                { state = RUNNING; startMs = millis(); lastActivityMs = millis(); }
 void doStop(unsigned long el) { elapsedMs = el;  state = STOPPED;   lastActivityMs = millis(); }
-void doReset()                { state = IDLE;    elapsedMs = 0;     lastActivityMs = millis(); }
+void doReset()                { lastElapsedMs = elapsedMs; state = IDLE; elapsedMs = 0; lastActivityMs = millis(); }
 
 // ── Deep Sleep ────────────────────────────────────────────────────
 void enterDeepSleep() {
@@ -155,6 +177,7 @@ void enterDeepSleep() {
 
     oled.clearDisplay();
     oled.display();
+    oled.ssd1306_command(SSD1306_DISPLAYOFF);
     delay(10);
 
     WiFi.disconnect(true);
@@ -218,7 +241,15 @@ void setup() {
 
     Serial.begin(115200);
     delay(100);
-    Serial.println(F("\n[CLIENT] Boote..."));
+
+    // Deep-Sleep-Nachweis: Aufwachgrund ausgeben
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause == ESP_SLEEP_WAKEUP_EXT0)
+        Serial.println(F("\n[CLIENT] Aufgewacht aus Deep Sleep (Taster)"));
+    else if (cause == ESP_SLEEP_WAKEUP_UNDEFINED)
+        Serial.println(F("\n[CLIENT] Boote... (Kaltstart / Reset)"));
+    else
+        Serial.printf("\n[CLIENT] Boote... (Wakeup cause: %d)\n", cause);
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     pinMode(DISP_PWR_PIN, OUTPUT);
@@ -241,7 +272,7 @@ void setup() {
 
     lastActivityMs  = millis();
     lastReconnectMs = millis();
-    renderDisplay(0, "Knopf=Start  4s=AUS");
+    renderDisplay(0);
 }
 
 // ── Loop ──────────────────────────────────────────────────────────
@@ -265,22 +296,25 @@ void loop() {
     }
 
     rawBtn = digitalRead(BUTTON_PIN);
-    if (rawBtn != lastRawBtn) { debounceTimer = now; lastRawBtn = rawBtn; }
-    if ((now - debounceTimer) >= DEBOUNCE_MS && rawBtn != debouncedBtn) {
-        debouncedBtn = rawBtn;
-        if (debouncedBtn == LOW) {
-            btnPressMs = now; btnHeld = true;
-            lastActivityMs = now;
-            if      (state == IDLE)    { doStart(); sendUDP("START"); }
-            else if (state == RUNNING) {
-                unsigned long el = now - startMs;
-                doStop(el);
-                char msg[32];
-                snprintf(msg, sizeof(msg), "STOP:%lu", el);
-                sendUDP(msg);
-            }
-            else if (state == STOPPED) { doReset(); sendUDP("RESET"); }
-        } else { btnHeld = false; }
+    if (rawBtn != lastRawBtn) {
+        lastRawBtn = rawBtn;
+        if ((now - debounceTimer) >= DEBOUNCE_MS) {
+            debounceTimer = now;
+            debouncedBtn = rawBtn;
+            if (debouncedBtn == LOW) {
+                btnPressMs = now; btnHeld = true;
+                lastActivityMs = now;
+                if      (state == IDLE)    { doStart(); sendUDP("START"); }
+                else if (state == RUNNING) {
+                    unsigned long el = now - startMs;
+                    doStop(el);
+                    char msg[32];
+                    snprintf(msg, sizeof(msg), "STOP:%lu", el);
+                    sendUDP(msg);
+                }
+                else if (state == STOPPED) { doReset(); sendUDP("RESET"); }
+            } else { btnHeld = false; }
+        }
     }
 
     if (btnHeld && (now - btnPressMs) >= HOLD_OFF_MS) {
@@ -302,9 +336,9 @@ void loop() {
         }
     }
 
-    if      (state == RUNNING) renderDisplay(now - startMs, "LAEUFT   Knopf=Stop");
-    else if (state == STOPPED) renderDisplay(elapsedMs,     "STOPP    Knopf=Reset");
-    else                       renderDisplay(0,              "Knopf=Start  4s=AUS");
+    if      (state == RUNNING) renderDisplay(now - startMs);
+    else if (state == STOPPED) renderDisplay(elapsedMs);
+    else                       renderDisplay(0);
 
     delay(16);
 }
