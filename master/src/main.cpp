@@ -3,15 +3,16 @@
  *
  * Pins:
  *   OLED  SDA=GPIO21  SCL=GPIO22
- *   OLED  VCC=GPIO26  (direkt am Pin, HIGH=an / LOW=aus)
+ *   OLED  VCC → Transistor (BC547) → GPIO26 schaltet
  *   Taster GPIO27 → GND (INPUT_PULLUP)
- *   Akku  47kΩ/47kΩ Teiler → GPIO33 (ADC1_CH5)
+ *   Akku  GPIO35 (interner 100kΩ/100kΩ Teiler auf Lolin32, JST-Stecker)
  *
  * Verhalten:
  *   - Kurzdruck: Start → Stop → Reset
  *   - 4 Sek halten: Deep Sleep
  *   - 10 Min Inaktivität: Deep Sleep
  *   - Aufwachen: Tasterdruck
+ *   - Deep Sleep: GPIO26 per gpio_hold LOW gehalten → kein Leckverlust
  */
 
 #include <Arduino.h>
@@ -25,15 +26,15 @@
 
 // ── Pins & Konstanten ─────────────────────────────────────────────
 #define BUTTON_PIN     27
-#define DISP_PWR_PIN   26
-#define BATT_PIN       35   // GPIO35 = eingebauter 100k/100k Teiler auf Lolin32
+#define DISP_PWR_PIN   26   // Transistor-Basis: HIGH=Display an, LOW=aus
+#define BATT_PIN       35   // interner 100kΩ/100kΩ Teiler auf Lolin32
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT  64
 #define UDP_PORT     1234
 #define DEBOUNCE_MS    60
 
-#define DEEPSLEEP_MS (10UL * 60UL * 1000UL)   // 10 Min → Deep Sleep
-#define HOLD_OFF_MS   4000UL                   //  4 Sek halten → Deep Sleep
+#define DEEPSLEEP_MS (10UL * 60UL * 1000UL)
+#define HOLD_OFF_MS   4000UL
 
 const char*     AP_SSID = "StopwatchNet";
 const char*     AP_PASS = "stopwatch123";
@@ -63,8 +64,9 @@ unsigned long lastActivityMs = 0;
 
 // ── Batterie ──────────────────────────────────────────────────────
 float readBattVoltage() {
+    // GPIO35: interner 100k/100k Teiler → V_bat = V_adc × 2
     int raw = analogRead(BATT_PIN);
-    return (raw / 4095.0f) * 3.3f * 2.0f;   // 47k/47k Teiler
+    return (raw / 4095.0f) * 3.3f * 2.0f;
 }
 
 int battPercent(float v) {
@@ -80,6 +82,14 @@ uint8_t detectOLED() {
         if (Wire.endTransmission() == 0) return addr;
     }
     return 0x3C;
+}
+
+void oledOn() {
+    digitalWrite(DISP_PWR_PIN, HIGH);
+    delay(80);
+    Wire.begin(21, 22);
+    oled.begin(SSD1306_SWITCHCAPVCC, oledAddr);
+    oled.setTextColor(SSD1306_WHITE);
 }
 
 void renderDisplay(unsigned long ms, const char* statusLine) {
@@ -110,7 +120,6 @@ void renderDisplay(unsigned long ms, const char* statusLine) {
     oled.setCursor(0, 44);
     oled.print(statusLine);
 
-    // Sleep-Countdown (letzte 60 Sekunden)
     if (state != RUNNING) {
         unsigned long idleSec = (millis() - lastActivityMs) / 1000UL;
         long secsLeft = (long)(DEEPSLEEP_MS / 1000UL) - (long)idleSec;
@@ -144,21 +153,20 @@ void enterDeepSleep() {
     sendUDP("DEEPSLEEP");
     delay(100);
 
-    // Warten bis Taste los → kein Sofort-Aufwachen
     while (digitalRead(BUTTON_PIN) == LOW) delay(10);
     delay(200);
 
-    // Display aus
+    // Display hardware ausschalten
     oled.clearDisplay();
     oled.display();
-    delay(20);
+    delay(10);
 
-    // WiFi komplett abschalten (spart ~80mA im Sleep)
+    // WiFi komplett abschalten
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_OFF);
     delay(100);
 
-    // GPIO26 (Display-VCC) LOW festhalten — verhindert Strom durch floating Pin
+    // GPIO26 LOW halten im Deep Sleep → kein Strom durch floating Pin
     digitalWrite(DISP_PWR_PIN, LOW);
     gpio_hold_en(GPIO_NUM_26);
     gpio_deep_sleep_hold_en();
@@ -169,7 +177,7 @@ void enterDeepSleep() {
 
 // ── Setup ─────────────────────────────────────────────────────────
 void setup() {
-    // GPIO-Hold vom letzten Deep Sleep aufheben
+    // GPIO-Hold vom Deep Sleep aufheben bevor wir den Pin steuern
     gpio_hold_dis(GPIO_NUM_26);
     gpio_deep_sleep_hold_dis();
 
@@ -179,16 +187,15 @@ void setup() {
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     pinMode(DISP_PWR_PIN, OUTPUT);
-    digitalWrite(DISP_PWR_PIN, HIGH);
+    digitalWrite(DISP_PWR_PIN, HIGH);   // Display einschalten
     delay(80);
 
-    // Warten bis Taste los (verhindert Neustart-Schleife nach Wakeup)
     while (digitalRead(BUTTON_PIN) == LOW) delay(10);
     delay(100);
 
     btStop();
     setCpuFrequencyMhz(80);
-    analogSetPinAttenuation(BATT_PIN, ADC_11db);  // bis ~3.9V Eingang
+    analogSetPinAttenuation(BATT_PIN, ADC_11db);
 
     Wire.begin(21, 22);
     oledAddr = detectOLED();
@@ -229,12 +236,9 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
-    // ── Deep Sleep Timer ──────────────────────────────────────────
-    if (state != RUNNING && (now - lastActivityMs) >= DEEPSLEEP_MS) {
+    if (state != RUNNING && (now - lastActivityMs) >= DEEPSLEEP_MS)
         enterDeepSleep();
-    }
 
-    // ── Taster entprellen ─────────────────────────────────────────
     rawBtn = digitalRead(BUTTON_PIN);
     if (rawBtn != lastRawBtn) { debounceTimer = now; lastRawBtn = rawBtn; }
     if ((now - debounceTimer) >= DEBOUNCE_MS && rawBtn != debouncedBtn) {
@@ -250,37 +254,29 @@ void loop() {
                 sendUDP(msg);
             }
             else if (state == STOPPED) { doReset(); sendUDP("RESET"); }
-        } else {
-            btnHeld = false;
-        }
+        } else { btnHeld = false; }
     }
 
-    // ── 4-Sek-Hold → Deep Sleep ───────────────────────────────────
     if (btnHeld && (now - btnPressMs) >= HOLD_OFF_MS) {
         btnHeld = false;
         enterDeepSleep();
     }
 
-    // ── UDP empfangen ─────────────────────────────────────────────
     int pkt = udp.parsePacket();
     if (pkt > 0) {
         char buf[64] = {};
         udp.read(buf, sizeof(buf) - 1);
         String msg(buf);
         Serial.printf("[UDP RX] %s\n", msg.c_str());
-        if (msg == "START" && state == IDLE) {
-            doStart();
-        } else if (msg.startsWith("STOP:") && state == RUNNING) {
+        if      (msg == "START" && state == IDLE)            doStart();
+        else if (msg.startsWith("STOP:") && state == RUNNING) {
             elapsedMs = (unsigned long)msg.substring(5).toInt();
             state = STOPPED; lastActivityMs = millis();
-        } else if (msg == "RESET" && state == STOPPED) {
-            doReset();
-        } else if (msg == "DEEPSLEEP") {
-            enterDeepSleep();
         }
+        else if (msg == "RESET" && state == STOPPED)         doReset();
+        else if (msg == "DEEPSLEEP")                         enterDeepSleep();
     }
 
-    // ── Display ───────────────────────────────────────────────────
     if      (state == RUNNING) renderDisplay(now - startMs, "LAEUFT   Knopf=Stop");
     else if (state == STOPPED) renderDisplay(elapsedMs,     "STOPP    Knopf=Reset");
     else                       renderDisplay(0,              "Knopf=Start  4s=AUS");

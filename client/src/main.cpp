@@ -3,16 +3,17 @@
  *
  * Pins:
  *   OLED  SDA=GPIO21  SCL=GPIO22
- *   OLED  VCC=GPIO26  (direkt am Pin, HIGH=an / LOW=aus)
+ *   OLED  VCC → Transistor (BC547) → GPIO26 schaltet
  *   Taster GPIO27 → GND (INPUT_PULLUP)
- *   Akku  47kΩ/47kΩ Teiler → GPIO33 (ADC1_CH5)
+ *   Akku  GPIO35 (interner 100kΩ/100kΩ Teiler auf Lolin32, JST-Stecker)
  *
  * Verhalten:
  *   - Kurzdruck: Start → Stop → Reset
- *   - 4 Sek halten: Deep Sleep (auch ohne WiFi-Verbindung)
- *   - 10 Min Inaktivität: Deep Sleep (auch ohne WiFi-Verbindung)
+ *   - 4 Sek halten: Deep Sleep (auch ohne WiFi)
+ *   - 10 Min Inaktivität: Deep Sleep (auch ohne WiFi)
  *   - Aufwachen: Tasterdruck
- *   - Kein Master: Offline-Modus, alle Sleep-Funktionen laufen trotzdem
+ *   - Kein Master: Offline-Modus, Sleep funktioniert trotzdem
+ *   - Deep Sleep: GPIO26 per gpio_hold LOW gehalten → kein Leckverlust
  */
 
 #include <Arduino.h>
@@ -26,16 +27,16 @@
 
 // ── Pins & Konstanten ─────────────────────────────────────────────
 #define BUTTON_PIN     27
-#define DISP_PWR_PIN   26
-#define BATT_PIN       35   // GPIO35 = eingebauter 100k/100k Teiler auf Lolin32
+#define DISP_PWR_PIN   26   // Transistor-Basis: HIGH=Display an, LOW=aus
+#define BATT_PIN       35   // interner 100kΩ/100kΩ Teiler auf Lolin32
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT  64
 #define UDP_PORT     1234
 #define DEBOUNCE_MS    60
 
-#define DEEPSLEEP_MS    (10UL * 60UL * 1000UL)  // 10 Min → Deep Sleep
-#define HOLD_OFF_MS     4000UL                   //  4 Sek halten → Deep Sleep
-#define RECONNECT_MS   30000UL                   // 30 Sek zwischen Reconnect-Versuchen
+#define DEEPSLEEP_MS  (10UL * 60UL * 1000UL)
+#define HOLD_OFF_MS    4000UL
+#define RECONNECT_MS  30000UL
 
 const char*     STA_SSID = "StopwatchNet";
 const char*     STA_PASS = "stopwatch123";
@@ -115,7 +116,6 @@ void renderDisplay(unsigned long ms, const char* statusLine) {
     oled.setCursor(0, 44);
     oled.print(statusLine);
 
-    // Sleep-Countdown (letzte 60 Sekunden)
     if (state != RUNNING) {
         unsigned long idleSec = (millis() - lastActivityMs) / 1000UL;
         long secsLeft = (long)(DEEPSLEEP_MS / 1000UL) - (long)idleSec;
@@ -140,31 +140,28 @@ void sendUDP(const char* msg) {
 }
 
 // ── Aktionen ──────────────────────────────────────────────────────
-void doStart()           { state = RUNNING; startMs = millis(); lastActivityMs = millis(); }
-void doStop(unsigned long el) { elapsedMs = el; state = STOPPED; lastActivityMs = millis(); }
-void doReset()           { state = IDLE; elapsedMs = 0; lastActivityMs = millis(); }
+void doStart()                { state = RUNNING; startMs = millis(); lastActivityMs = millis(); }
+void doStop(unsigned long el) { elapsedMs = el;  state = STOPPED;   lastActivityMs = millis(); }
+void doReset()                { state = IDLE;    elapsedMs = 0;     lastActivityMs = millis(); }
 
 // ── Deep Sleep ────────────────────────────────────────────────────
 void enterDeepSleep() {
     Serial.println(F("[SLEEP] Deep Sleep"));
-    sendUDP("DEEPSLEEP");     // kein Problem wenn nicht verbunden
+    sendUDP("DEEPSLEEP");
     delay(100);
 
-    // Warten bis Taste los → kein Sofort-Aufwachen
     while (digitalRead(BUTTON_PIN) == LOW) delay(10);
     delay(200);
 
-    // Display aus
     oled.clearDisplay();
     oled.display();
-    delay(20);
+    delay(10);
 
-    // WiFi komplett abschalten
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     delay(100);
 
-    // GPIO26 (Display-VCC) LOW festhalten — verhindert Strom durch floating Pin
+    // GPIO26 LOW halten im Deep Sleep → kein Strom durch floating Pin
     digitalWrite(DISP_PWR_PIN, LOW);
     gpio_hold_en(GPIO_NUM_26);
     gpio_deep_sleep_hold_en();
@@ -173,7 +170,7 @@ void enterDeepSleep() {
     esp_deep_sleep_start();
 }
 
-// ── WiFi verbinden (non-blocking nach Timeout) ────────────────────
+// ── WiFi verbinden ────────────────────────────────────────────────
 void tryConnectWiFi() {
     oled.clearDisplay();
     oled.setTextSize(1);
@@ -187,7 +184,6 @@ void tryConnectWiFi() {
     for (int i = 1; i <= 20; i++) {
         delay(500);
         if (WiFi.status() == WL_CONNECTED) break;
-        // Zeile sauber überschreiben
         oled.fillRect(0, 22, 128, 10, SSD1306_BLACK);
         oled.setCursor(0, 22);
         char buf[22];
@@ -205,7 +201,7 @@ void tryConnectWiFi() {
         oled.setCursor(0,  0); oled.print(F("Verbunden!"));
         oled.setCursor(0, 14); oled.print(WiFi.localIP());
     } else {
-        Serial.println(F("[WiFi] Kein Master — Offline-Modus"));
+        Serial.println(F("[WiFi] Kein Master — Offline"));
         oled.setCursor(0,  0); oled.print(F("Kein Master!"));
         oled.setCursor(0, 14); oled.print(F("Offline-Modus"));
         oled.setCursor(0, 28); oled.print(F("4s=AUS  10min=AUS"));
@@ -216,7 +212,7 @@ void tryConnectWiFi() {
 
 // ── Setup ─────────────────────────────────────────────────────────
 void setup() {
-    // GPIO-Hold vom letzten Deep Sleep aufheben
+    // GPIO-Hold vom Deep Sleep aufheben
     gpio_hold_dis(GPIO_NUM_26);
     gpio_deep_sleep_hold_dis();
 
@@ -226,16 +222,15 @@ void setup() {
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     pinMode(DISP_PWR_PIN, OUTPUT);
-    digitalWrite(DISP_PWR_PIN, HIGH);
+    digitalWrite(DISP_PWR_PIN, HIGH);   // Display einschalten
     delay(80);
 
-    // Warten bis Taste los
     while (digitalRead(BUTTON_PIN) == LOW) delay(10);
     delay(100);
 
     btStop();
     setCpuFrequencyMhz(80);
-    analogSetPinAttenuation(BATT_PIN, ADC_11db);  // bis ~3.9V Eingang
+    analogSetPinAttenuation(BATT_PIN, ADC_11db);
 
     Wire.begin(21, 22);
     oledAddr = detectOLED();
@@ -253,28 +248,22 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
-    // ── Deep Sleep Timer ──────────────────────────────────────────
-    if (state != RUNNING && (now - lastActivityMs) >= DEEPSLEEP_MS) {
+    if (state != RUNNING && (now - lastActivityMs) >= DEEPSLEEP_MS)
         enterDeepSleep();
-    }
 
-    // ── WiFi Reconnect (alle 30 Sek, nicht blockierend) ───────────
+    // WiFi Reconnect alle 30s (nicht blockierend)
     if (WiFi.status() != WL_CONNECTED && (now - lastReconnectMs) >= RECONNECT_MS) {
         lastReconnectMs = now;
-        Serial.println(F("[WiFi] Reconnect..."));
         WiFi.reconnect();
-        // Kurz warten ob es klappt
         unsigned long t = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - t < 3000) delay(100);
         if (WiFi.status() == WL_CONNECTED) {
             WiFi.setTxPower(WIFI_POWER_5dBm);
             WiFi.setSleep(true);
             udp.begin(UDP_PORT);
-            Serial.println(F("[WiFi] Reconnect OK"));
         }
     }
 
-    // ── Taster entprellen ─────────────────────────────────────────
     rawBtn = digitalRead(BUTTON_PIN);
     if (rawBtn != lastRawBtn) { debounceTimer = now; lastRawBtn = rawBtn; }
     if ((now - debounceTimer) >= DEBOUNCE_MS && rawBtn != debouncedBtn) {
@@ -291,18 +280,14 @@ void loop() {
                 sendUDP(msg);
             }
             else if (state == STOPPED) { doReset(); sendUDP("RESET"); }
-        } else {
-            btnHeld = false;
-        }
+        } else { btnHeld = false; }
     }
 
-    // ── 4-Sek-Hold → Deep Sleep ───────────────────────────────────
     if (btnHeld && (now - btnPressMs) >= HOLD_OFF_MS) {
         btnHeld = false;
         enterDeepSleep();
     }
 
-    // ── UDP empfangen ─────────────────────────────────────────────
     if (WiFi.status() == WL_CONNECTED) {
         int pkt = udp.parsePacket();
         if (pkt > 0) {
@@ -310,19 +295,13 @@ void loop() {
             udp.read(buf, sizeof(buf) - 1);
             String msg(buf);
             Serial.printf("[UDP RX] %s\n", msg.c_str());
-            if (msg == "START" && state == IDLE) {
-                doStart();
-            } else if (msg.startsWith("STOP:") && state == RUNNING) {
-                doStop((unsigned long)msg.substring(5).toInt());
-            } else if (msg == "RESET" && state == STOPPED) {
-                doReset();
-            } else if (msg == "DEEPSLEEP") {
-                enterDeepSleep();
-            }
+            if      (msg == "START" && state == IDLE)             doStart();
+            else if (msg.startsWith("STOP:") && state == RUNNING) doStop((unsigned long)msg.substring(5).toInt());
+            else if (msg == "RESET" && state == STOPPED)          doReset();
+            else if (msg == "DEEPSLEEP")                          enterDeepSleep();
         }
     }
 
-    // ── Display ───────────────────────────────────────────────────
     if      (state == RUNNING) renderDisplay(now - startMs, "LAEUFT   Knopf=Stop");
     else if (state == STOPPED) renderDisplay(elapsedMs,     "STOPP    Knopf=Reset");
     else                       renderDisplay(0,              "Knopf=Start  4s=AUS");
