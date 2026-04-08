@@ -1,18 +1,18 @@
 /*
- * ESP32 WiFi-Stoppuhr — MASTER (COM8, erstellt Access Point)
+ * ESP32 WiFi-Stoppuhr — MASTER (COM9, erstellt Access Point)
  *
  * Pins:
  *   OLED  SDA=GPIO21  SCL=GPIO22
- *   OLED  VCC=GPIO26  (HIGH=an, LOW=aus)
+ *   OLED  VCC=GPIO26  (HIGH=an, LOW=aus — direkt am Pin)
  *   Taster GPIO27 → GND (INPUT_PULLUP)
  *   Akku  47kΩ/47kΩ Teiler → GPIO33 (ADC1_CH5)
  *
  * Verhalten:
  *   - Kurzdruck: Start → Stop → Reset
- *   - 4 Sek halten: sofort Deep Sleep
- *   - 8 Min Inaktivität (IDLE/STOPPED): Display aus + Light Sleep
- *   - 18 Min Inaktivität: Deep Sleep
- *   - Aufwachen: beliebiger Tasterdruck
+ *   - 4 Sek halten: Deep Sleep (beide Geräte aus bis Tasterdruck)
+ *   - 1 Min Inaktivität: Display aus (Standby) — ESP läuft weiter
+ *   - 10 Min Inaktivität: Deep Sleep
+ *   - Knopf im Standby: beide Displays wieder an (per UDP "WAKE")
  */
 
 #include <Arduino.h>
@@ -32,9 +32,9 @@
 #define UDP_PORT     1234
 #define DEBOUNCE_MS    60
 
-#define LIGHT_SLEEP_MS  ( 1UL * 60UL * 1000UL)   //  1 Minute
-#define DEEP_SLEEP_MS   (10UL * 60UL * 1000UL)   // 10 Minuten
-#define HOLD_DEEP_MS    4000UL                    //  4 Sek halten
+#define STANDBY_MS   ( 1UL * 60UL * 1000UL)   // 1 Min → Display aus
+#define DEEPSLEEP_MS (10UL * 60UL * 1000UL)   // 10 Min → Deep Sleep
+#define HOLD_OFF_MS   4000UL                   // 4 Sek halten → Deep Sleep
 
 const char*     AP_SSID = "StopwatchNet";
 const char*     AP_PASS = "stopwatch123";
@@ -51,6 +51,7 @@ unsigned long startMs    = 0;
 unsigned long elapsedMs  = 0;
 uint8_t       oledAddr   = 0x3C;
 bool          dispOn     = true;
+bool          inStandby  = false;
 
 // ── Taster ────────────────────────────────────────────────────────
 bool          rawBtn        = HIGH;
@@ -62,18 +63,15 @@ bool          btnHeld       = false;
 
 // ── Aktivitäts-Timer ──────────────────────────────────────────────
 unsigned long lastActivityMs = 0;
-bool          lightSlept     = false;
 
 // ── Batterie ──────────────────────────────────────────────────────
 float readBattVoltage() {
-    // GPIO33 = ADC1_CH5, 47k/47k Teiler → V_bat = V_adc × 2
     int raw = analogRead(BATT_PIN);
     float v_adc = (raw / 4095.0f) * 3.3f;
-    return v_adc * 2.0f;
+    return v_adc * 2.0f;  // 47k/47k Teiler
 }
 
 int battPercent(float v) {
-    // Li-Ion: 4.2V = 100%, 3.0V = 0%
     if (v >= 4.2f) return 100;
     if (v <= 3.0f) return 0;
     return (int)((v - 3.0f) / 1.2f * 100.0f + 0.5f);
@@ -88,16 +86,17 @@ uint8_t detectOLED() {
     return 0x3C;
 }
 
-void oledPowerOn() {
+void oledOn() {
     digitalWrite(DISP_PWR_PIN, HIGH);
     delay(80);
     Wire.begin(21, 22);
     oled.begin(SSD1306_SWITCHCAPVCC, oledAddr);
     oled.setTextColor(SSD1306_WHITE);
-    dispOn = true;
+    dispOn    = true;
+    inStandby = false;
 }
 
-void oledPowerOff() {
+void oledOff() {
     oled.clearDisplay();
     oled.display();
     delay(10);
@@ -115,7 +114,6 @@ void renderDisplay(unsigned long ms, const char* statusLine) {
     unsigned long s  = (ms % 60000UL) / 1000UL;
     unsigned long cs = (ms % 1000UL) / 10UL;
 
-    // Maximal 7 Zeichen: "9:59.99" → 7 × 18px = 126px, passt ab x=1
     char timeBuf[10];
     snprintf(timeBuf, sizeof(timeBuf), "%lu:%02lu.%02lu", m, s, cs);
 
@@ -124,7 +122,7 @@ void renderDisplay(unsigned long ms, const char* statusLine) {
 
     oled.clearDisplay();
 
-    // Zeit (gross)
+    // Zeit (gross) — 7 Zeichen × 18px = 126px, ab x=1 passt alles
     oled.setTextSize(3);
     oled.setCursor(1, 2);
     oled.print(timeBuf);
@@ -141,19 +139,19 @@ void renderDisplay(unsigned long ms, const char* statusLine) {
     oled.setCursor(0, 44);
     oled.print(statusLine);
 
-    // Sleep-Hinweis (wann Display aus)
-    unsigned long idleSec = (millis() - lastActivityMs) / 1000UL;
-    if (idleSec > 10 && state != RUNNING) {
-        char hintBuf[22];
-        unsigned long secLeft = (LIGHT_SLEEP_MS / 1000UL) - idleSec;
-        if (idleSec < LIGHT_SLEEP_MS / 1000UL) {
-            snprintf(hintBuf, sizeof(hintBuf), "Sleep in %lus", secLeft);
-        } else {
-            snprintf(hintBuf, sizeof(hintBuf), "Deep in %lus",
-                     (DEEP_SLEEP_MS / 1000UL) - idleSec);
+    // Standby-Countdown (letzte 20 Sekunden)
+    if (state != RUNNING) {
+        unsigned long idleSec = (millis() - lastActivityMs) / 1000UL;
+        unsigned long standbyIn = STANDBY_MS / 1000UL;
+        if (idleSec >= standbyIn - 20) {
+            long secsLeft = (long)standbyIn - (long)idleSec;
+            if (secsLeft > 0) {
+                char hintBuf[20];
+                snprintf(hintBuf, sizeof(hintBuf), "Standby in %lds", secsLeft);
+                oled.setCursor(0, 56);
+                oled.print(hintBuf);
+            }
         }
-        oled.setCursor(0, 56);
-        oled.print(hintBuf);
     }
 
     oled.display();
@@ -167,39 +165,27 @@ void sendUDP(const char* msg) {
     Serial.printf("[UDP TX] %s\n", msg);
 }
 
-// ── Aktivität ─────────────────────────────────────────────────────
-void resetActivity() {
+// ── Aktivität + Display aufwecken ─────────────────────────────────
+void wakeDisplay() {
+    if (!dispOn) oledOn();
     lastActivityMs = millis();
-    lightSlept     = false;
-    if (!dispOn) oledPowerOn();
+    inStandby      = false;
 }
 
 // ── Stoppuhr-Aktionen ─────────────────────────────────────────────
-void doStart() { state = RUNNING; startMs = millis(); resetActivity(); }
-void doStop()  { elapsedMs = millis() - startMs; state = STOPPED; resetActivity(); }
-void doReset() { state = IDLE; elapsedMs = 0; resetActivity(); }
+void doStart() { state = RUNNING; startMs = millis(); lastActivityMs = millis(); }
+void doStop()  { elapsedMs = millis() - startMs; state = STOPPED; lastActivityMs = millis(); }
+void doReset() { state = IDLE; elapsedMs = 0; lastActivityMs = millis(); }
 
-// ── Sleep ─────────────────────────────────────────────────────────
-void enterLightSleep() {
-    Serial.println(F("[SLEEP] Light Sleep"));
-    oledPowerOff();
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 0);
-    esp_light_sleep_start();
-    // ─── Aufgewacht ───
-    Serial.println(F("[SLEEP] Aufgewacht (Light)"));
-    oledPowerOn();
-    // Debounce-Zustand zurücksetzen
-    debounceTimer = millis();
-    rawBtn = lastRawBtn = debouncedBtn = HIGH;
-    btnHeld = false;
-    resetActivity();
-}
-
+// ── Deep Sleep ────────────────────────────────────────────────────
 void enterDeepSleep() {
     Serial.println(F("[SLEEP] Deep Sleep"));
     sendUDP("DEEPSLEEP");
     delay(100);
-    oledPowerOff();
+    // Warten bis Taste losgelassen → kein Sofort-Aufwachen
+    while (digitalRead(BUTTON_PIN) == LOW) delay(10);
+    delay(200);
+    oledOff();
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 0);
     esp_deep_sleep_start();
     // kein return
@@ -208,7 +194,7 @@ void enterDeepSleep() {
 // ── Setup ─────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    delay(200);
+    delay(100);
     Serial.println(F("\n[MASTER] Boote..."));
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -216,7 +202,11 @@ void setup() {
     digitalWrite(DISP_PWR_PIN, HIGH);
     delay(80);
 
-    analogSetPinAttenuation(BATT_PIN, ADC_11db);  // 0–3.9V Messbereich
+    // Warten bis Taster losgelassen (verhindert Sofort-Neustart nach Wakeup)
+    while (digitalRead(BUTTON_PIN) == LOW) delay(10);
+    delay(100);
+
+    analogSetPinAttenuation(BATT_PIN, ADC_11db);
 
     Wire.begin(21, 22);
     oledAddr = detectOLED();
@@ -241,8 +231,11 @@ void setup() {
     Serial.printf("[WiFi] AP: %s  IP: %s\n", AP_SSID,
                   WiFi.softAPIP().toString().c_str());
 
-    oled.setCursor(0, 36); oled.print(F("IP: ")); oled.print(WiFi.softAPIP());
-    oled.setCursor(0, 50); oled.print(F("Warte auf Client..."));
+    oled.clearDisplay();
+    oled.setCursor(0,  0); oled.print(F("MASTER - WiFi AP"));
+    oled.setCursor(0, 12); oled.print(F("SSID: StopwatchNet"));
+    oled.setCursor(0, 24); oled.print(F("IP: ")); oled.print(WiFi.softAPIP());
+    oled.setCursor(0, 36); oled.print(F("Warte auf Client..."));
     oled.display();
 
     udp.begin(UDP_PORT);
@@ -257,15 +250,14 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
-    // ── Sleep-Timer (nur wenn nicht läuft) ───────────────────────
+    // ── Standby / Deep Sleep Timer (nur wenn nicht läuft) ─────────
     if (state != RUNNING) {
         unsigned long idle = now - lastActivityMs;
-        if (idle >= DEEP_SLEEP_MS) {
+        if (idle >= DEEPSLEEP_MS) {
             enterDeepSleep();
-        } else if (idle >= LIGHT_SLEEP_MS && !lightSlept) {
-            lightSlept = true;
-            enterLightSleep();
-            now = millis();   // Zeit nach Aufwachen aktualisieren
+        } else if (idle >= STANDBY_MS && !inStandby) {
+            inStandby = true;
+            oledOff();
         }
     }
 
@@ -279,20 +271,27 @@ void loop() {
         debouncedBtn = rawBtn;
 
         if (debouncedBtn == LOW) {
-            // Taste gedrückt → Aktion + Hold-Timer starten
+            // Taste gedrückt
             btnPressMs = now;
             btnHeld    = true;
-            resetActivity();
 
-            if (state == IDLE) {
-                doStart(); sendUDP("START");
-            } else if (state == RUNNING) {
-                doStop();
-                char msg[32];
-                snprintf(msg, sizeof(msg), "STOP:%lu", elapsedMs);
-                sendUDP(msg);
-            } else if (state == STOPPED) {
-                doReset(); sendUDP("RESET");
+            if (inStandby || !dispOn) {
+                // Im Standby: beide Displays aufwecken, keine Stoppuhr-Aktion
+                wakeDisplay();
+                sendUDP("WAKE");
+            } else {
+                // Normal: Stoppuhr bedienen
+                lastActivityMs = now;
+                if (state == IDLE) {
+                    doStart(); sendUDP("START");
+                } else if (state == RUNNING) {
+                    doStop();
+                    char msg[32];
+                    snprintf(msg, sizeof(msg), "STOP:%lu", elapsedMs);
+                    sendUDP(msg);
+                } else if (state == STOPPED) {
+                    doReset(); sendUDP("RESET");
+                }
             }
         } else {
             // Taste losgelassen
@@ -300,11 +299,10 @@ void loop() {
         }
     }
 
-    // ── 4-Sek-Hold → Neustart ────────────────────────────────────
-    if (btnHeld && (now - btnPressMs) >= HOLD_DEEP_MS) {
-        sendUDP("RESET");
-        delay(100);
-        ESP.restart();
+    // ── 4-Sek-Hold → Deep Sleep ───────────────────────────────────
+    if (btnHeld && (now - btnPressMs) >= HOLD_OFF_MS) {
+        btnHeld = false;
+        enterDeepSleep();
     }
 
     // ── UDP empfangen ─────────────────────────────────────────────
@@ -315,16 +313,16 @@ void loop() {
         String msg(buf);
         Serial.printf("[UDP RX] %s\n", msg.c_str());
 
-        if (msg == "START" && state == IDLE) {
-            doStart();
+        if (msg == "WAKE") {
+            wakeDisplay();
+        } else if (msg == "START" && state == IDLE) {
+            doStart(); wakeDisplay();
         } else if (msg.startsWith("STOP:") && state == RUNNING) {
             elapsedMs = (unsigned long)msg.substring(5).toInt();
-            state = STOPPED; resetActivity();
+            state = STOPPED; lastActivityMs = millis();
         } else if (msg == "RESET" && state == STOPPED) {
             doReset();
-        }
-        // DEEPSLEEP vom Client: wir schlafen auch
-        else if (msg == "DEEPSLEEP") {
+        } else if (msg == "DEEPSLEEP") {
             enterDeepSleep();
         }
     }
