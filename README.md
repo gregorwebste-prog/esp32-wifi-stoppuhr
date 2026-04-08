@@ -1,6 +1,6 @@
 # ESP32 WiFi-Stoppuhr
 
-Zwei ESP32-Geräte synchronisieren eine Stoppuhr per WiFi (UDP-Broadcast).
+Zwei ESP32 Wemos Lolin32 synchronisieren eine Stoppuhr per WiFi (UDP-Broadcast).
 Beide zeigen dieselbe Zeit auf einem OLED-Display — jeder kann Start/Stop/Reset auslösen.
 
 ---
@@ -8,48 +8,68 @@ Beide zeigen dieselbe Zeit auf einem OLED-Display — jeder kann Start/Stop/Rese
 ## Hardware
 
 ### Benötigt (je Gerät)
-- ESP32 DevKit (Lolin32 o.ä.)
+- ESP32 Wemos Lolin32
 - OLED SSD1306 128×64 I2C
 - Taster (Momentary, NO)
-- 2× 47 kΩ Widerstände (Spannungsteiler Akku)
 - Li-Ion 18650 3500 mAh + Halter
-- TP4056 Lademodul (empfohlen)
+- JST-PH 2.0mm Kabel für Batterieanschluss
 
 ### Pin-Belegung
 
-| Signal        | GPIO | Hinweis                         |
-|---------------|------|---------------------------------|
-| OLED SDA      | 21   |                                 |
-| OLED SCL      | 22   |                                 |
-| OLED VCC      | 26   | über NPN/N-MOSFET schalten      |
-| Taster        | 27   | → GND, intern Pull-Up           |
-| Akku ADC      | 33   | ADC1_CH5 (funktioniert mit WiFi)|
+| Signal        | GPIO | Hinweis                                      |
+|---------------|------|----------------------------------------------|
+| OLED SDA      | 21   |                                              |
+| OLED SCL      | 22   |                                              |
+| OLED VCC      | 26   | Direkt am Pin (HIGH=an, LOW=aus)             |
+| Taster        | 27   | → GND, intern Pull-Up                        |
+| Akku ADC      | 35   | Eingebauter 100kΩ/100kΩ Teiler auf Lolin32   |
+
+### Batterie-Anschluss
+
+Den **JST-PH 2.0mm Stecker** auf dem Lolin32 verwenden — **nicht** den 5V-Pin!
+
+```
+18650 ──JST──► Lolin32 Lade-IC (TP4056)
+                    │
+                    ▼
+              3.3V Regler (für LiPo ausgelegt, 3.0–4.2V Eingang)
+                    │
+                    ▼
+                  ESP32
+```
+
+Beim JST-Stecker Polarität prüfen: **Rot = +, Schwarz = −**
+Wenn USB eingesteckt ist, wird der Akku automatisch geladen.
+
+### Akkuspannung messen
+
+Der Lolin32 hat einen eingebauten Spannungsteiler (100kΩ/100kΩ) auf **GPIO35** — kein externer Teiler nötig.
+
+```
+Akku+ ──[100kΩ]──┬──[100kΩ]── GND
+                 └── GPIO35 (ADC1_CH7)
+```
+
+Formel: `V_bat = ADC_Spannung × 2`
 
 ### Display-Abschalter (GPIO 26)
 
-GPIO 26 schaltet die Display-Versorgung über einen NPN-Transistor oder N-MOSFET:
+GPIO 26 schaltet OLED-VCC direkt (kein Transistor nötig bei SSD1306).
+Im Deep Sleep wird GPIO 26 per `gpio_hold_en()` LOW gehalten → kein Ruhestrom.
 
-```
-GPIO26 ──[1kΩ]── Basis NPN (z.B. 2N2222)
-                 Collector → OLED VCC
-                 Emitter   → GND
+---
 
-   oder N-MOSFET (z.B. IRLZ44N / BS170):
-GPIO26 ──[10kΩ]── Gate
-                  Drain → OLED VCC
-                  Source → GND
-```
+## Ladezeit
 
-> HIGH = Display ein | LOW = Display aus (kein Ruhestrom)
+Der Lolin32 lädt über den eingebauten **TP4056** Lade-IC (500 mA via USB 2.0):
 
-### Spannungsteiler Akku (GPIO 33)
+| Akkustand | Ladezeit bei 500 mA |
+|-----------|---------------------|
+| 0 → 100%  | ~8–10 Stunden       |
+| 20 → 80%  | ~4–5 Stunden        |
+| 80 → 100% | ~2–3 Stunden (CV-Phase, Strom nimmt ab) |
 
-```
-LiIon+ ──[47kΩ]──┬──[47kΩ]── GND
-                 └── GPIO33
-```
-
-Messbereich: 3.0–4.2 V → ADC 1.5–2.1 V (passt in 11 dB Attenuation, ADC1)
+> Bei USB 3.0 oder Schnellladegerät bleibt der TP4056 trotzdem bei 500 mA — das ist sein Hardware-Limit.
 
 ---
 
@@ -58,14 +78,10 @@ Messbereich: 3.0–4.2 V → ADC 1.5–2.1 V (passt in 11 dB Attenuation, ADC1)
 | Aktion              | Verhalten                                  |
 |---------------------|--------------------------------------------|
 | Kurzdruck           | Start → Stop → Reset (zyklisch)           |
-| 4 Sek halten        | Sofort Deep Sleep                          |
-| 8 Min Inaktivität   | Display aus + Light Sleep                  |
-| 18 Min Inaktivität  | Deep Sleep                                 |
-| Aufwachen           | Beliebiger Tasterdruck                     |
-| Deep Sleep Wakeup   | Vollständiger Neustart, WiFi reconnect     |
-| `DEEPSLEEP` per UDP | Wenn ein Gerät schläft, schläft das andere auch |
-
-Das Display zeigt während der Wartezeit einen Countdown bis zum nächsten Sleep an.
+| 4 Sek halten        | Deep Sleep (auch ohne WiFi)                |
+| 10 Min Inaktivität  | Deep Sleep                                 |
+| Aufwachen           | Tasterdruck                                |
+| Kein Master         | Client läuft im Offline-Modus, Sleep aktiv |
 
 ---
 
@@ -73,11 +89,11 @@ Das Display zeigt während der Wartezeit einen Countdown bis zum nächsten Sleep
 
 ```
 ┌────────────────────────────┐
-│ 0:00.00                    │  ← Textgröße 3, max 9:59.99 (7 Zeichen = 126px)
-│ 3.87V   72%  [M]           │  ← Akku (M=Master / C=Client)
+│ 0:00.00                    │  ← Textgröße 3, max 9:59.99
+│ 3.87V   72%  [M]           │  ← Akku (M=Master / C=Client, !!= kein WiFi)
 │────────────────────────────│
 │ Knopf=Start  4s=AUS        │  ← Statuszeile
-│ Sleep in 450s              │  ← nur wenn idle > 10s
+│ Sleep in 45s               │  ← letzte 60s vor Deep Sleep
 └────────────────────────────┘
 ```
 
@@ -85,42 +101,42 @@ Das Display zeigt während der Wartezeit einen Countdown bis zum nächsten Sleep
 
 ## Stromverbrauch & Akkulaufzeit
 
-Gemessen/geschätzt bei 3.7 V (Li-Ion nominal), ESP32 + SSD1306:
-
 | Zustand                           | Strom     | Laufzeit mit 3500 mAh |
 |-----------------------------------|-----------|------------------------|
-| Aktiv, Display an, WiFi aktiv     | ~150 mA   | ~23 Stunden            |
-| Aktiv, Display aus, WiFi aktiv    | ~120 mA   | ~29 Stunden            |
-| Light Sleep, Display aus, WiFi    | ~3–5 mA   | ~700–1160 Stunden      |
-| Deep Sleep (nur RTC)              | ~15 µA    | ~27 000 Stunden        |
+| Master aktiv (WiFi AP + Display)  | ~115 mA   | ~30 Stunden            |
+| Client aktiv (WiFi STA + Display) | ~35 mA    | ~100 Stunden           |
+| Deep Sleep (gpio_hold aktiv)      | ~15–25 µA | ~16 000 Stunden        |
 
-### Typisches Nutzungsprofil
-
-Beispiel: täglich 10× je 5 Minuten messen, sonst Deep Sleep.
+### Typisches Nutzungsprofil (10× 5 min/Tag)
 
 ```
-Pro Nutzung:
-  5 Min aktiv (Display an)  = 5/60 × 150 mA  = 12.5 mAh
-  8 Min idle bis Light Sleep = 8/60 × 120 mA  = 16.0 mAh
-  ──────────────────────────────────────────────────────
-  Pro Session total:                           ~ 28.5 mAh
-
-  10 Sessions/Tag:                             ~285 mAh/Tag
-  → 3500 mAh / 285 mAh ≈ 12 Tage ohne Laden
+Pro Session (Master):   5/60 × 115 mA ≈ 9.6 mAh
+Pro Tag (10 Sessions):  ~96 mAh
+→ 3500 mAh / 96 mAh ≈  36 Tage ohne Laden
 ```
-
-Deep Sleep zwischen den Sessions kostet praktisch nichts (~0.05 mAh/Std).
 
 ---
 
 ## WiFi-Protokoll (UDP Broadcast 192.168.4.255:1234)
 
-| Nachricht      | Bedeutung                                        |
-|----------------|--------------------------------------------------|
-| `START`        | Stoppuhr starten                                 |
-| `STOP:<ms>`    | Stoppuhr stoppen, `<ms>` = gemessene Millisekunden |
-| `RESET`        | Zurücksetzen auf 0                               |
-| `DEEPSLEEP`    | Beide Geräte gehen in Deep Sleep                 |
+| Nachricht      | Bedeutung                                  |
+|----------------|--------------------------------------------|
+| `START`        | Stoppuhr starten                           |
+| `STOP:<ms>`    | Stoppuhr stoppen, `<ms>` = Millisekunden   |
+| `RESET`        | Zurücksetzen                               |
+| `DEEPSLEEP`    | Beide Geräte gehen in Deep Sleep           |
+
+---
+
+## Energiespar-Maßnahmen
+
+| Maßnahme              | Einsparung |
+|-----------------------|------------|
+| CPU 80 MHz (statt 240)| ~40 mA     |
+| WiFi Modem Sleep      | ~60 mA     |
+| TX-Power 5 dBm        | ~15 mA     |
+| Bluetooth deaktiviert | ~5 mA      |
+| GPIO26 hold im Sleep  | verhindert ~20 mA Leckverlust |
 
 ---
 
@@ -129,10 +145,10 @@ Deep Sleep zwischen den Sessions kostet praktisch nichts (~0.05 mAh/Std).
 ```
 esp32_stopwatch/
 ├── master/
-│   ├── platformio.ini      # Board: esp32dev, Port: COM8
+│   ├── platformio.ini      # Board: lolin32, Port: COM9
 │   └── src/main.cpp        # Master-Firmware (erstellt WiFi-AP)
 ├── client/
-│   ├── platformio.ini      # Board: esp32dev, Port: COM5
+│   ├── platformio.ini      # Board: lolin32, Port: COM5
 │   └── src/main.cpp        # Client-Firmware (verbindet mit AP)
 └── README.md
 ```
@@ -141,46 +157,17 @@ esp32_stopwatch/
 
 ## Bauen & Flashen
 
-Benötigt: [PlatformIO](https://platformio.org/)
-
 ```bash
-# Master flashen (COM8)
-cd master
-pio run --target upload
-
-# Client flashen (COM5)
-cd client
-pio run --target upload
-```
-
-### platformio.ini
-
-```ini
-[env:esp32_master]
-platform = espressif32
-board = esp32dev
-framework = arduino
-monitor_speed = 115200
-lib_deps =
-    adafruit/Adafruit SSD1306
-    adafruit/Adafruit GFX Library
+cd master && pio run --target upload   # COM9
+cd client && pio run --target upload   # COM5
 ```
 
 ---
 
 ## Bedienung
 
-1. **Master zuerst einschalten** — erstellt AP `StopwatchNet`
-2. **Client einschalten** — verbindet sich automatisch
+1. **Master zuerst einschalten** → erstellt AP `StopwatchNet`
+2. **Client einschalten** → verbindet automatisch (~10 Sek)
 3. **Taster** auf beliebigem Gerät → Start / Stop / Reset
-4. **4 Sek halten** → Deep Sleep (beide Geräte)
-
----
-
-## Bekannte Einschränkungen
-
-- Während Master im **Light Sleep** ist, verliert Client die WiFi-Verbindung.  
-  Er reconnected automatisch sobald Master aufwacht.
-- **Deep Sleep** setzt Zustand zurück (kein gespeicherter Zwischenstand).
-- ESP32 ADC hat leichte Nichtlinearität — Akkuanzeige ±0.05 V Toleranz ist normal.
-- Latenzt zwischen Displays: typisch < 5 ms.
+4. **4 Sek halten** → beide Geräte in Deep Sleep
+5. **USB einstecken** → Akku lädt automatisch (LED auf Lolin32 zeigt Ladestatus)

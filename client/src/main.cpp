@@ -27,7 +27,7 @@
 // ── Pins & Konstanten ─────────────────────────────────────────────
 #define BUTTON_PIN     27
 #define DISP_PWR_PIN   26
-#define BATT_PIN       33
+#define BATT_PIN       35   // GPIO35 = eingebauter 100k/100k Teiler auf Lolin32
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT  64
 #define UDP_PORT     1234
@@ -235,7 +235,7 @@ void setup() {
 
     btStop();
     setCpuFrequencyMhz(80);
-    analogSetPinAttenuation(BATT_PIN, ADC_11db);
+    analogSetPinAttenuation(BATT_PIN, ADC_11db);  // bis ~3.9V Eingang
 
     Wire.begin(21, 22);
     oledAddr = detectOLED();
